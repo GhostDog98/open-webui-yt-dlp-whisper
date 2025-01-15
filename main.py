@@ -5,7 +5,7 @@ author_url: https://website.com
 git_url: https://github.com/username/string-reverse.git
 description: This tool downloads a YouTube video and gets SRT subtitles using YouTubeDL and Whisper. 
 required_open_webui_version: 0.4.0
-requirements: yt-dlp, pydub, requests, time
+requirements: yt-dlp, pydub, requests
 version: 0.4.0
 licence: MIT
 """
@@ -17,85 +17,84 @@ from pydub import AudioSegment
 from pydub.exceptions import CouldntDecodeError
 from pydantic import BaseModel, Field
 import time
-
-import yt_dlp
-import io
-import requests
-from pydub import AudioSegment
-from pydub.exceptions import CouldntDecodeError
-from pydantic import BaseModel, Field
-import time  # Import the time module for timing
+import os
 
 class Tools:
     def __init__(self):
         pass
-    
-    def get_subtitles(self, url: str):
+
+    async def get_subtitles(self, url: str, __event_emitter__=None) -> str:
         start_time = time.time()  # Start timing the entire function
+        await __event_emitter__(
+            {
+                "type": "status",
+                "data": {"description":"Downloading audio...", "done": False}
+            }
+        )
+        
+
+        video_id = url.split('v=')[-1]
 
         # Define options for YouTubeDL to extract audio in m4a format
         ydl_opts = {
-            'format': 'm4a/bestaudio/best',  # Choose the best available audio format
-            'extract_audio': True,  # Extract audio from the video
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',  # Use FFmpeg to extract audio
-                'preferredcodec': 'wav',  # Prefer m4a as the audio codec,
-                'preferredquality': '16k'  # Set the quality to 16k (16 kHz)
-            }],
-            'noplaylist': True,
-            'extractaudio': True,
-            
-        }
+            'extract_flat': 'discard_in_playlist',
+            'final_ext': 'wav',
+            'format': 'bestaudio/best',
+            'fragment_retries': 10,
+            'ignoreerrors': 'only_download',
+            'outtmpl': {'default': '%(id)s.%(ext)s'},
+            'paths': {'home': '/tmp/'},
+            'postprocessor_args': {'ffmpeg': ['-ar', '16000']},
+            'postprocessors': [{'key': 'FFmpegExtractAudio',
+                               'nopostoverwrites': False,
+                               'preferredcodec': 'wav',
+                               'preferredquality': '5'},
+                              {'key': 'FFmpegConcat',
+                               'only_multi_video': True,
+                               'when': 'playlist'}],
+            'retries': 10}
 
-        # Use YouTubeDL with the defined options
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Extract metadata about the video/audio without downloading it
-            info_dict = ydl.extract_info(url, download=False)
-            
-            # Get the direct URL of the audio stream from the metadata
-            audio_url = info_dict['url']
-            
-            # Download the audio data using requests, streaming it in chunks
-            response = requests.get(audio_url, stream=True)
-            
-            # Use a buffer to capture the audio data as it is downloaded
-            buffer = io.BytesIO()
-            for chunk in response.iter_content(chunk_size=8192):
-                buffer.write(chunk)  # Write each chunk to the buffer
-        
-        audio_data = buffer.getvalue()  # Now `buffer` contains the complete audio data
+            info_dict = ydl.extract_info(video_id, download=True)
+            await __event_emitter__(
+            {
+                "type": "status",
+                "data": {"description":"Saving Audio to temp file...", "done": False}
+            }
+        )
+            with open(f'/tmp/{video_id}.wav', 'rb') as f:
+                audio_data = f.read()
 
-        # Log the time taken to download and buffer the audio
         download_time = time.time() - start_time
-        print(f"Audio download and buffering completed in {download_time:.2f} seconds")
+        print(f"Downloaded {video_id} in {download_time:.2f} seconds")
 
-        # Load the audio data into a PyDub AudioSegment object
-        audio_load_start = time.time()
-        audio = AudioSegment.from_file(io.BytesIO(audio_data), format='m4a')
-        audio = audio.set_channels(1)  # Convert stereo audio to mono
-        audio = audio.set_frame_rate(16000)  # Set the audio frame rate to 16kHz
 
-        # Convert the audio to WAV format
-        wav_buffer = io.BytesIO()
-        audio.export(wav_buffer, format='wav')  # Export audio to WAV format
-        wav_data = wav_buffer.getvalue()  # Get the WAV data from the buffer
+        print("Audio Metadata")
+        important_metadata = {
+            'id': info_dict['id'],
+            'title': info_dict['title'],
+            'description': info_dict['description'],
+            'tags': info_dict['tags'],
+            'location': info_dict['location'],
+            'channel': info_dict['channel'],
+        }
+        metadata_str = '\n'.join([f"{key}: {value}" for key, value in important_metadata.items()])
 
-        # Log the time taken to load and convert the audio
-        audio_load_time = time.time() - audio_load_start
-        print(f"Audio loading and conversion completed in {audio_load_time:.2f} seconds")
+        await __event_emitter__(
+            {
+                "type": "status",
+                "data": {"description":"Sending Audio to Whisper model for transcription...", "done": False}
+            }
+        )
 
-        # Print audio details for verification
-        print("Audio verified to be valid!")
-        print(f"Audio duration: {audio.duration_seconds} seconds")
-        print(f"Audio channels: {audio.channels}")
-        print(f"Audio sample rate: {audio.frame_rate} Hz")
 
         # Define the URL for the Whisper inference server
         whisper_server_url = "http://localhost:8192/inference"
 
         # Prepare the WAV file and additional data for the Whisper API request
         files = {
-            'file': ('input.wav', io.BytesIO(wav_data), 'audio/wav')  # WAV file to be sent
+            # Send wav file
+            'file': ('input.wav', io.BytesIO(audio_data), 'audio/wav')  
         }
         data = {
             'temperature': '0.0',  # Set temperature for inference
@@ -106,6 +105,12 @@ class Tools:
         # Send the audio data to the Whisper server for transcription
         whisper_start = time.time()
         response = requests.post(whisper_server_url, files=files, data=data)
+        await __event_emitter__(
+            {
+                "type": "status",
+                "data": {"description":"Saving whisper transcription...", "done": False}
+            }
+        )
 
         # Log the time taken for Whisper inference
         whisper_time = time.time() - whisper_start
@@ -115,9 +120,23 @@ class Tools:
         total_time = time.time() - start_time
         print(f"Total execution time: {total_time:.2f} seconds")
 
+        print(f"Cleaning up temporary files...")
+        os.remove(f'/tmp/{video_id}.wav')
+
+        await __event_emitter__(
+            {
+                "type":"message",
+                "data": {"content": f"Whisper transcription completed in {whisper_time:.2f} seconds"}
+            }
+        )
+
         # Check if the Whisper inference was successful
         if response.status_code == 200:
             print("Whisper inference successful!")
-            return f"Provide a summary of the transcript from the following VTT subtitles: {response.text}"
+            return_object = metadata_str + "\n\nTranscription:\n```\n" + response.text + '\n```'
+            return return_object
+        else:
+            return "Whisper inference failed."
+        
 
         
